@@ -129,19 +129,18 @@ globalThis.SessionTool = (() => {
     } finally { db.close(); }
   }
   const readQuotaSetting = () => { try { const v = Number(localStorage.getItem(QUOTA_KEY)); return v > 0 ? v : null; } catch (_) { return null; } };
-  function setQuotaBytes(bytes) { // null = back to automatic
+  function setQuotaBytes(bytes) { // null = back to the default
     try { if (bytes == null) localStorage.removeItem(QUOTA_KEY); else localStorage.setItem(QUOTA_KEY, String(Math.round(bytes))); } catch (_) { /* storage blocked */ }
   }
-  async function browserQuota() { try { return (await navigator.storage.estimate()).quota || 0; } catch (_) { return 0; } }
 
-  // Automatic default: 10 GB, or 10% of the browser's per-site quota if that is smaller (small disks).
+  // Default limit: fixed 10 GB. (navigator.storage.estimate().quota is not usable as a basis: Chrome reports
+  // an artificial "usage + 10 GiB" there, unrelated to the real enforced quota or to eviction.)
   async function quotaInfo() {
     const u = await imageUsage();
-    const bq = await browserQuota();
-    const auto = bq > 0 ? Math.min(10 * GB, bq * 0.1) : 10 * GB;
+    const auto = 10 * GB;
     const set = readQuotaSetting();
     const quota = set ?? auto;
-    return { used: u.total, count: u.count, bySession: u.bySession, quota, auto, custom: set != null, browserQuota: bq, over: u.total > quota };
+    return { used: u.total, count: u.count, bySession: u.bySession, quota, auto, custom: set != null, over: u.total > quota };
   }
 
   async function assertRoom(extra, what) {

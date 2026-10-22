@@ -32,7 +32,7 @@
       <header><b>🗂 セッション管理</b><span><button id="imp">取り込み</button> <button id="rel">更新</button></span></header>
       <div id="quota">
         <div id="qline"></div><div id="qbar"><i></i></div>
-        <div id="qset">上限 <input id="qin" type="number" min="0.1" step="0.5"> GB <button id="qsave">設定</button> <button id="qauto">自動に戻す</button></div>
+        <div id="qset">上限 <input id="qin" type="number" min="0.1" step="0.5"> GB <button id="qsave">設定</button> <button id="qauto">初期値に戻す</button></div>
       </div>
       <div id="msg"></div>
       <button id="reload" hidden>ページを再読み込み</button>
@@ -63,7 +63,7 @@
     const ban = $('#qbanner');
     ban.hidden = !q.over;
     ban.textContent = q.over ? `セッション全体のクオータが設定量を超えています（現在 ${fb(q.used)} / 設定 ${fb(q.quota)}）。複製・取り込みはできません。` : '';
-    $('#qline').textContent = `保存量 ${fb(q.used)} / 上限 ${fb(q.quota)}（${q.custom ? '手動設定' : '自動'}・画像${q.count}枚）`;
+    $('#qline').textContent = `保存量 ${fb(q.used)} / 上限 ${fb(q.quota)}（${q.custom ? '手動設定' : '初期値'}・画像${q.count}枚）`;
     const bar = $('#qbar i');
     bar.style.width = Math.min(100, pct * 100) + '%';
     bar.className = q.over ? 'over' : pct >= 0.8 ? 'warn' : '';
@@ -133,7 +133,7 @@
     if (!(v > 0)) { msg('上限はGB単位の正の数で入力してください。', true); return; }
     T.setQuotaBytes(v * T.GB); msg(`上限を ${v} GB に設定しました。`); render();
   };
-  $('#qauto').onclick = () => { T.setQuotaBytes(null); msg('上限を自動設定に戻しました。'); render(); };
+  $('#qauto').onclick = () => { T.setQuotaBytes(null); msg('上限を初期値（10GB）に戻しました。'); render(); };
   $('#reload').onclick = () => location.reload();
   $('#imp').onclick = () => $('#file').click();
   $('#file').onchange = (e) => {
