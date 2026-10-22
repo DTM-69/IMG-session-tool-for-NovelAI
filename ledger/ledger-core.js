@@ -1,0 +1,157 @@
+// Ledger core: reads sessions exported by the extension (ZIP) and builds CSV / HTML ledgers.
+// Pure functions only (no DOM, no network).
+globalThis.Ledger = (() => {
+  async function zipRead(buf) { // ArrayBuffer -> Map<name, Uint8Array>
+    const dv = new DataView(buf), u8 = new Uint8Array(buf);
+    let e = -1;
+    for (let i = buf.byteLength - 22; i >= Math.max(0, buf.byteLength - 65557); i--) if (dv.getUint32(i, true) === 0x06054b50) { e = i; break; }
+    if (e < 0) throw new Error('ZIPファイルとして読めません');
+    const count = dv.getUint16(e + 10, true);
+    let p = dv.getUint32(e + 16, true);
+    const out = new Map();
+    for (let i = 0; i < count; i++) {
+      if (dv.getUint32(p, true) !== 0x02014b50) throw new Error('ZIPの目録が壊れています');
+      const method = dv.getUint16(p + 10, true), csize = dv.getUint32(p + 20, true);
+      const nl = dv.getUint16(p + 28, true), xl = dv.getUint16(p + 30, true), cl = dv.getUint16(p + 32, true);
+      const lo = dv.getUint32(p + 42, true);
+      const name = new TextDecoder().decode(u8.subarray(p + 46, p + 46 + nl));
+      const start = lo + 30 + dv.getUint16(lo + 26, true) + dv.getUint16(lo + 28, true);
+      let data = u8.subarray(start, start + csize);
+      if (method === 8) data = new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer());
+      else if (method !== 0) throw new Error('未対応の圧縮方式: ' + method);
+      out.set(name, data);
+      p += 46 + nl + xl + cl;
+    }
+    return out;
+  }
+
+  // NovelAI embeds the request parameters as JSON in the PNG tEXt chunk "Comment".
+  function pngComment(u8) {
+    if (u8.length < 8 || u8[0] !== 0x89 || u8[1] !== 0x50) return null;
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    let p = 8;
+    while (p + 8 <= u8.length) {
+      const n = dv.getUint32(p);
+      const type = String.fromCharCode(u8[p + 4], u8[p + 5], u8[p + 6], u8[p + 7]);
+      if (type === 'tEXt') {
+        const d = u8.subarray(p + 8, p + 8 + n), z = d.indexOf(0);
+        if (z > 0 && new TextDecoder().decode(d.subarray(0, z)) === 'Comment') {
+          try { return JSON.parse(new TextDecoder().decode(d.subarray(z + 1))); } catch (_) { return null; }
+        }
+      }
+      if (type === 'IEND') break;
+      p += 12 + n;
+    }
+    return null;
+  }
+
+  const toDate = (v) => {
+    if (v && typeof v === 'object' && v.$date) v = v.$date;
+    if (typeof v !== 'string') return null;
+    const d = new Date(/(Z|[+-]\d\d:?\d\d)$/.test(v) ? v : v + 'Z'); // NovelAI stores UTC
+    return isNaN(d) ? null : d;
+  };
+  const pad = (n) => String(n).padStart(2, '0');
+  const fmtTime = (d) => d ? `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}` : '';
+  const first = (...xs) => xs.find((x) => x !== undefined && x !== null && x !== '' && x !== '<Undefined>');
+
+  // Prompt/params prefer the values embedded in the PNG (what was really sent);
+  // the session record is the fallback (e.g. when the original image is gone).
+  async function loadSession(arrayBuffer, fileName) {
+    const files = await zipRead(arrayBuffer);
+    const j = files.get('session.json');
+    if (!j) throw new Error(`${fileName}: session.json がありません`);
+    const doc = JSON.parse(new TextDecoder().decode(j));
+    if (doc.format !== 'novelai-session-tool/1') throw new Error(`${fileName}: このツールの拡張機能で書き出したZIPではありません`);
+    const fileById = new Map((doc.images || []).map((m) => [m.id, m.file]));
+    const groups = Array.isArray(doc.groups) ? doc.groups : Object.entries(doc.groups || {});
+    const byId = new Map(groups);
+    const order = [...(doc.meta.groupOrder || []).filter((g) => byId.has(g)), ...groups.map(([g]) => g).filter((g) => !(doc.meta.groupOrder || []).includes(g))];
+    const rows = [];
+    for (const gid of order) {
+      for (const im of byId.get(gid).images || []) {
+        const p = im.params || {}, pp = p.params || {};
+        const file = fileById.get(im.data && im.data[0]);
+        const m = file && files.has(file) ? pngComment(files.get(file)) : null;
+        const chars = m && m.v4_prompt && m.v4_prompt.caption && m.v4_prompt.caption.char_captions
+          ? m.v4_prompt.caption.char_captions.map((c) => c.char_caption)
+          : (pp.characterPrompts || []).map((c) => c && c.prompt).filter(Boolean);
+        const t = toDate(im.genDateTime);
+        rows.push({
+          time: t, timeText: fmtTime(t),
+          model: first(p.model) || '', mode: first(p.modelMode) || '',
+          width: first(im.width, m && m.width, pp.width) || '', height: first(im.height, m && m.height, pp.height) || '',
+          steps: first(m && m.steps, pp.steps) ?? '', scale: first(m && m.scale, pp.scale) ?? '',
+          sampler: first(m && m.sampler, pp.sampler) || '', noise: first(m && m.noise_schedule, pp.noise_schedule) || '',
+          seed: first(m && m.seed, p.seed) ?? '',
+          prompt: first(m && m.prompt, p.prompt) || '',
+          negative: first(m && m.uc, p.negPrompt, pp.uc) || '',
+          chars, labels: (im.labels || []).join('/'),
+          file: file || '', thumb: typeof im.thumbnail === 'string' && im.thumbnail.startsWith('data:image/') ? im.thumbnail : '',
+          source: m ? 'PNG' : '記録',
+        });
+      }
+    }
+    rows.sort((a, b) => (a.time || 0) - (b.time || 0));
+    rows.forEach((r, i) => { r.no = i + 1; });
+    return { name: doc.meta.name || 'History', id: doc.meta.id, lastSaved: toDate(doc.meta.lastSavedAt), exportedAt: doc.exportedAt, fileName, rows };
+  }
+
+  const CSV_COLS = [['session', 'セッション'], ['no', 'No'], ['timeText', '生成日時'], ['model', 'モデル'], ['mode', 'モード'], ['width', '幅'], ['height', '高さ'],
+    ['steps', 'ステップ'], ['scale', 'スケール'], ['sampler', 'サンプラー'], ['noise', 'ノイズスケジュール'], ['seed', 'シード'],
+    ['prompt', 'プロンプト'], ['negative', 'ネガティブ'], ['charText', 'キャラクタープロンプト'], ['labels', '種別'], ['file', '画像ファイル'], ['source', '情報源']];
+  const csvCell = (v) => { const s = String(v ?? ''); return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  function toCSV(sessions) {
+    const lines = [CSV_COLS.map((c) => csvCell(c[1])).join(',')];
+    for (const s of sessions) for (const r of s.rows) {
+      const o = { ...r, session: `${s.name} ${fmtTime(s.lastSaved)} (${(s.id || '').slice(0, 8)})`, charText: r.chars.join(' | ') };
+      lines.push(CSV_COLS.map((c) => csvCell(o[c[0]])).join(','));
+    }
+    return '﻿' + lines.join('\r\n') + '\r\n'; // BOM so Excel opens it as UTF-8
+  }
+
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  function toHTML(sessions) {
+    const total = sessions.reduce((a, s) => a + s.rows.length, 0);
+    const body = sessions.map((s) => `
+<section>
+<h2>${esc(s.name)} <small>${esc(fmtTime(s.lastSaved))} / ${s.rows.length}枚 / ${esc((s.id || '').slice(0, 8))} / ${esc(s.fileName || '')}</small></h2>
+<table><thead><tr><th>No</th><th>サムネイル</th><th>生成日時 / モデル / 設定</th><th>プロンプト（クリックでコピー）</th></tr></thead><tbody>
+${s.rows.map((r) => `<tr>
+<td class="no">${r.no}</td>
+<td class="th">${r.thumb ? `<img src="${esc(r.thumb)}" loading="lazy">` : '<span class="nothumb">—</span>'}</td>
+<td class="meta">${esc(r.timeText)}<br>${esc(r.model)} ${esc(r.mode)}<br>${esc(r.width)}×${esc(r.height)} / steps ${esc(r.steps)} / scale ${esc(r.scale)}<br>${esc(r.sampler)} ${esc(r.noise)}<br>seed <b>${esc(r.seed)}</b><br><span class="file">${esc(r.file)}</span> <span class="src">[${esc(r.source)}]</span></td>
+<td class="pr"><div class="p" data-label="プロンプト">${esc(r.prompt)}</div>${r.chars.map((c, i) => `<div class="p ch" data-label="キャラ${i + 1}">${esc(c)}</div>`).join('')}${r.negative ? `<div class="p neg" data-label="ネガティブ">${esc(r.negative)}</div>` : ''}</td>
+</tr>`).join('')}
+</tbody></table></section>`).join('');
+    return `<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NovelAI 生成台帳</title>
+<style>
+:root{color-scheme:light dark;--bg:#fff;--fg:#1c1d29;--mut:#777;--line:#ddd;--card:#f6f6fa;--acc:#3b5bdb}
+@media (prefers-color-scheme:dark){:root{--bg:#14151f;--fg:#e8e8f0;--mut:#99a;--line:#2e3048;--card:#1d1f2e;--acc:#8fa5ff}}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,sans-serif}
+h1{font-size:20px;margin:0 0 4px} h2{font-size:16px;margin:24px 0 8px} h2 small{color:var(--mut);font-weight:400;font-size:12px}
+.top{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:8px} input{padding:6px 10px;min-width:260px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg)}
+.wrap{overflow-x:auto} table{border-collapse:collapse;width:100%} th,td{border-bottom:1px solid var(--line);padding:8px;vertical-align:top;text-align:left}
+th{font-size:12px;color:var(--mut);position:sticky;top:0;background:var(--bg)} .no{color:var(--mut);width:36px} .th img{width:128px;height:128px;object-fit:cover;border-radius:6px;display:block}
+.meta{font-size:12px;min-width:210px;white-space:nowrap} .file,.src{color:var(--mut)} .pr{min-width:320px}
+.p{white-space:pre-wrap;word-break:break-word;background:var(--card);border-radius:6px;padding:6px 8px;margin-bottom:6px;cursor:pointer;font-size:13px}
+.p::before{content:attr(data-label);display:block;font-size:11px;color:var(--acc)} .p.neg{opacity:.75} .p:hover{outline:1px solid var(--acc)} .p.copied{outline:2px solid #2f9e44}
+tr.hide{display:none}
+</style></head><body>
+<h1>NovelAI 生成台帳</h1>
+<div class="top"><span>${sessions.length}セッション / ${total}枚</span><input id="q" type="search" placeholder="プロンプト・シード・モデルで絞り込み"></div>
+<div class="wrap">${body}</div>
+<script>
+const q=document.getElementById('q');
+q.addEventListener('input',()=>{const s=q.value.toLowerCase();document.querySelectorAll('tbody tr').forEach(tr=>tr.classList.toggle('hide',s&&!tr.textContent.toLowerCase().includes(s)))});
+document.addEventListener('click',e=>{const p=e.target.closest('.p');if(!p)return;const t=[...p.childNodes].filter(n=>n.nodeType===3).map(n=>n.textContent).join('');
+const done=()=>{p.classList.add('copied');setTimeout(()=>p.classList.remove('copied'),700)};
+if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(t).then(done,()=>fb(t,done));else fb(t,done)});
+function fb(t,done){const a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();try{document.execCommand('copy');done()}catch(_){}a.remove()}
+</script></body></html>`;
+  }
+
+  return { loadSession, toCSV, toHTML, pngComment, zipRead };
+})();
