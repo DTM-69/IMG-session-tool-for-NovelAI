@@ -20,9 +20,20 @@
       .actions{display:flex;gap:4px;flex-direction:column}
       #msg{margin:6px 0;color:#9cf;white-space:pre-wrap} #msg.err{color:#f99}
       header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+      #qbanner{background:#c92a2a;color:#fff;font-weight:600;padding:8px 10px;border-radius:8px;margin-bottom:6px;box-shadow:0 4px 16px #0008}
+      #qbanner[hidden]{display:none}
+      #quota{margin:4px 0 8px;font-size:12px;color:#bbc}
+      #qbar{height:6px;background:#2c2e48;border-radius:3px;overflow:hidden;margin:4px 0}
+      #qbar i{display:block;height:100%;width:0;background:#4c6ef5} #qbar i.warn{background:#f59f00} #qbar i.over{background:#e03131}
+      #qset{display:flex;gap:6px;align-items:center;flex-wrap:wrap} #qin{width:64px;background:#262944;color:#eee;border:1px solid #556;border-radius:6px;padding:2px 6px}
     </style>
+    <div id="qbanner" hidden></div>
     <div id="panel">
       <header><b>🗂 セッション管理</b><span><button id="imp">取り込み</button> <button id="rel">更新</button></span></header>
+      <div id="quota">
+        <div id="qline"></div><div id="qbar"><i></i></div>
+        <div id="qset">上限 <input id="qin" type="number" min="0.1" step="0.5"> GB <button id="qsave">設定</button> <button id="qauto">自動に戻す</button></div>
+      </div>
       <div id="msg"></div>
       <button id="reload" hidden>ページを再読み込み</button>
       <div id="list"></div>
@@ -40,14 +51,32 @@
     if (btn) btn.disabled = true;
     msg(label + ' …');
     try { await fn(); } catch (e) { console.error(e); msg('失敗: ' + (e.message || e), true); }
-    finally { if (btn) btn.disabled = false; }
+    finally { if (btn) btn.disabled = btn.dataset.locked === '1'; }
+  }
+
+  // A locked button stays disabled (quota) even after guarded() finishes.
+  function lock(btn, locked, why) { btn.dataset.locked = locked ? '1' : ''; btn.disabled = locked; btn.title = locked ? why : ''; }
+  const fb = (b) => T.fmtBytes(b);
+
+  function renderQuota(q) {
+    const pct = q.quota ? q.used / q.quota : 0;
+    const ban = $('#qbanner');
+    ban.hidden = !q.over;
+    ban.textContent = q.over ? `セッション全体のクオータが設定量を超えています（現在 ${fb(q.used)} / 設定 ${fb(q.quota)}）。複製・取り込みはできません。` : '';
+    $('#qline').textContent = `保存量 ${fb(q.used)} / 上限 ${fb(q.quota)}（${q.custom ? '手動設定' : '自動'}・画像${q.count}枚）`;
+    const bar = $('#qbar i');
+    bar.style.width = Math.min(100, pct * 100) + '%';
+    bar.className = q.over ? 'over' : pct >= 0.8 ? 'warn' : '';
+    $('#qin').value = (q.quota / T.GB).toFixed(1);
+    lock($('#imp'), q.over, 'クオータ超過のため取り込みできません');
   }
 
   async function render() {
     const list = $('#list');
     list.textContent = '';
-    let sessions;
-    try { sessions = await T.listSessions(); } catch (e) { msg(e.message, true); return; }
+    let sessions, q;
+    try { [sessions, q] = await Promise.all([T.listSessions(), T.quotaInfo()]); } catch (e) { msg(e.message, true); return; }
+    renderQuota(q);
     for (const s of sessions) {
       const row = document.createElement('div');
       row.className = 'row';
@@ -56,13 +85,17 @@
       const info = document.createElement('div');
       info.className = 'info';
       info.innerHTML = '<div></div><div class="id"></div>';
-      info.firstChild.textContent = `${s.name || 'History'} / ${s.imageCount ?? '?'}枚`;
+      const size = q.bySession.get(s.id) || 0;
+      info.firstChild.textContent = `${s.name || 'History'} / ${s.imageCount ?? '?'}枚 / ${fb(size)}`;
       info.lastChild.textContent = `${fmt(s.lastSavedAt)}\n${s.id}`;
       const act = document.createElement('div');
       act.className = 'actions';
       const dup = document.createElement('button'); dup.textContent = '複製';
       const exp = document.createElement('button'); exp.textContent = 'ZIP保存';
       const view = document.createElement('button'); view.textContent = '一覧表示';
+      const blocked = q.used + size > q.quota;
+      lock(dup, blocked, `複製すると上限を超えます（現在 ${fb(q.used)} ＋ ${fb(size)} > 上限 ${fb(q.quota)}）`);
+      if (blocked) dup.textContent = '複製不可';
       view.onclick = async () => {
         const w = window.open('', '_blank'); // must open synchronously, inside the click
         if (!w) { msg('ポップアップがブロックされました。このサイトのポップアップを許可してください。', true); return; }
@@ -95,6 +128,12 @@
   }
 
   $('#rel').onclick = render;
+  $('#qsave').onclick = () => {
+    const v = parseFloat($('#qin').value);
+    if (!(v > 0)) { msg('上限はGB単位の正の数で入力してください。', true); return; }
+    T.setQuotaBytes(v * T.GB); msg(`上限を ${v} GB に設定しました。`); render();
+  };
+  $('#qauto').onclick = () => { T.setQuotaBytes(null); msg('上限を自動設定に戻しました。'); render(); };
   $('#reload').onclick = () => location.reload();
   $('#imp').onclick = () => $('#file').click();
   $('#file').onchange = (e) => {
@@ -137,7 +176,7 @@
     host.style.left = left + 'px';
     host.style.top = top + 'px';
     host.style.width = width + 'px';
-    panel.style.maxHeight = Math.max(160, innerHeight - top - 90) + 'px';
+    panel.style.maxHeight = Math.max(160, innerHeight - top - 150) + 'px';
     if (!wasShown) { wasShown = true; msg(IDLE); render(); }
   }
   let timer = 0;
