@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "セッション管理ツール for NovelAI",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "description": "NovelAI画像生成のセッションを複製・ZIP保存・取り込み・一覧表示します（非公式・通信なし・ローカル完結）",
   "author": "だくてん with Claude",
   "content_scripts": [

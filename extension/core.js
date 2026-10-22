@@ -107,8 +107,56 @@ globalThis.SessionTool = (() => {
     return newId;
   }
 
+  // ---- storage quota (our own guard; counts image bytes of ALL sessions in this browser) ----
+  const GB = 1e9;
+  const QUOTA_KEY = 'nsm-quota-bytes';
+  const fmtBytes = (b) => (b >= 1e9 ? (b / 1e9).toFixed(2) + ' GB' : (b / 1e6).toFixed(b >= 1e8 ? 0 : 1) + ' MB');
+
+  async function imageUsage() {
+    const db = await openDb(IMG_DB);
+    try {
+      const st = db.transaction('images').objectStore('images');
+      const keys = await req(st.getAllKeys());
+      const vals = await req(st.getAll()); // Blob handles only; bytes are not read
+      const bySession = new Map();
+      let total = 0;
+      keys.forEach((k, i) => {
+        const sid = String(k).split(':')[0], n = (vals[i] && vals[i].size) || 0;
+        bySession.set(sid, (bySession.get(sid) || 0) + n);
+        total += n;
+      });
+      return { total, bySession, count: keys.length };
+    } finally { db.close(); }
+  }
+  const readQuotaSetting = () => { try { const v = Number(localStorage.getItem(QUOTA_KEY)); return v > 0 ? v : null; } catch (_) { return null; } };
+  function setQuotaBytes(bytes) { // null = back to the default
+    try { if (bytes == null) localStorage.removeItem(QUOTA_KEY); else localStorage.setItem(QUOTA_KEY, String(Math.round(bytes))); } catch (_) { /* storage blocked */ }
+  }
+
+  // Default limit: fixed 10 GB. (navigator.storage.estimate().quota is not usable as a basis: Chrome reports
+  // an artificial "usage + 10 GiB" there, unrelated to the real enforced quota or to eviction.)
+  async function quotaInfo() {
+    const u = await imageUsage();
+    const auto = 10 * GB;
+    const set = readQuotaSetting();
+    const quota = set ?? auto;
+    return { used: u.total, count: u.count, bySession: u.bySession, quota, auto, custom: set != null, over: u.total > quota };
+  }
+
+  async function assertRoom(extra, what) {
+    const q = await quotaInfo();
+    if (q.used + extra > q.quota) {
+      const e = new Error(`${what}できません: 上限 ${fmtBytes(q.quota)} に対し、現在 ${fmtBytes(q.used)} ＋ 追加 ${fmtBytes(extra)} = ${fmtBytes(q.used + extra)} になります。不要なセッションを削除するか、上限を上げてください。`);
+      e.code = 'QUOTA';
+      throw e;
+    }
+    return q;
+  }
+  const sumBlobs = (images) => images.reduce((a, [, b]) => a + b.size, 0);
+
   async function duplicateSession(id) {
     const data = await readSession(id);
+    await assertRoom(sumBlobs(data.images), '複製');
     const newId = crypto.randomUUID();
     await writeSession(newId, data, (data.meta.name || 'History') + ' (copy)');
     return newId;
@@ -221,10 +269,11 @@ globalThis.SessionTool = (() => {
       return [m.id, new Blob([bytes], { type: m.type })];
     });
     const data = { meta: dec(doc.meta), groups: doc.groups.map(([g, v]) => [g, dec(v)]), boards: dec(doc.boards), images };
+    await assertRoom(sumBlobs(images), '取り込み');
     const newId = crypto.randomUUID();
     await writeSession(newId, data, (data.meta.name || 'History') + ' (imported)');
     return newId;
   }
 
-  return { listSessions, readSession, duplicateSession, exportSessionZip, importSessionZip, deleteSessionData, _zip: { zipBuild, zipRead, crc32 } };
+  return { listSessions, readSession, duplicateSession, exportSessionZip, importSessionZip, deleteSessionData, quotaInfo, setQuotaBytes, fmtBytes, GB, _zip: { zipBuild, zipRead, crc32 } };
 })();
